@@ -17,6 +17,8 @@ import logging
 from google.cloud import storage
 
 app = Flask(__name__)
+DATA_PATH = Path('/home/gcmac/prod/prod_data')
+
 
 def get_clean_data(path):
     df = pd.read_json(path)
@@ -29,30 +31,49 @@ def get_json(path):
         data = json.load(f)
     return data
 
-data_path = Path('/home/gcmac/prod/prod_data')
 
-@app.before_first_request
-def load_data():
-    global listed_words
-    global list_popularity
-    global search_popularity
-    global tag_popularity
-    listed_words = get_clean_data(data_path/'valid_listed_words')
-    list_popularity = dict(listed_words.lcword.value_counts())
-    search_popularity = get_json(data_path/'word_cnts.json')
-    tag_popularity = get_json(data_path/'word_numtags_map.json')
+def filter_words(input_words, recommeded_words, stemmer):
+    """Filter out words that have the same stem
+    
+    Parameters
+    ----------
+    input_words : list
+        list of input words
+        
+    recommeded_words : list
+        list of recommended words
 
-    global model
-    model_path = data_path/'wiki.en.vec'
-    model = KeyedVectors.load_word2vec_format(model_path, binary=False)
+    stemmer : nltk.stem.porter.PorterStemmer
+        function that converts full word to stem of word
+    
+    Returns
+    -------
+    out : list
+        list of trimmed down version of lst that does not contain words that share same stems with input_
+    """
+    input_stems = set([stemmer.stem(input_word) for input_word in input_words])
+    return [word for word in recommeded_words if stemmer.stem(word) not in input_stems]
 
 
-def find_rank(lst, dic):
-    print("in find_rank")
-    words_in_pop_list = [w for w in lst if w in dic]
-    words_not_in_pop_list = [w for w in lst if w not in dic]
+def find_rank(words, popularity_metric):
+    """Given a list of (recommended) words, rank them based on popularity.
+    
+    Parameters
+    ----------
+    words : list
+        list of words
+    popularity_metric : dictionary
+        this is the "popularity dictionary", which shows the number of times each word is searched/tagged/listed
+    
+    Returns
+    -------
+    df : pandas.DataFrame
+        table containing the original list of words, and their popularity ranking
+    """
+    words_in_pop_list = [word for word in words if word in popularity_metric]
+    words_not_in_pop_list = [word for word in words if word not in popularity_metric]
     df_in_list = pd.DataFrame(
-        [dic[w] for w in words_in_pop_list],
+        [popularity_metric[word] for word in words_in_pop_list],
         index=words_in_pop_list,
         columns=['count']
     )
@@ -68,12 +89,23 @@ def find_rank(lst, dic):
     return df
 
 
-def filter_words(input_words, lst, stemmer):
-    input_stems = set([stemmer.stem(i) for i in input_words])
-    return [w for w in lst if stemmer.stem(w) not in input_stems]
-
-
 def find_words(input_words, n_outputs=1):
+    """Given an input list of words, find recommended words based on similarities.
+    
+    Parameters
+    ----------
+    input_words : list
+        list of words that the recommendation will be based on
+    
+    n_outputs: integer
+        the number of recommended (most similar) words wanted
+    
+    Returns
+    -------
+    out : list
+        list of words recommended
+    
+    """
     most_similar = model.most_similar(
         [word for word in input_words if word in model.vocab],
         topn=n_outputs
@@ -92,34 +124,47 @@ def recommend_words(input_words, n_outputs=5, multiple=5):
     stemmer = PorterStemmer()
     candidates = find_words(input_words, n_outputs=n_outputs*multiple)
     filtered_candidates = filter_words(input_words, candidates, stemmer)
-
-    # get list of rank of candidate words by popularity of list, search, tag on wordnik
-    rank_list = find_rank(filtered_candidates, dic=list_popularity)
-    rank_search = find_rank(filtered_candidates, dic=search_popularity)
-    rank_tag = find_rank(filtered_candidates, dic=tag_popularity)
-
-    # concat vectors from above and join
-    df = pd.concat([rank_list, rank_search, rank_tag], axis=1, sort=True).reset_index()
-    df['rank_sum'] = df['rank'].sum(axis=1)
-    df['stem'] = df['index'].apply(lambda x: stemmer.stem(x))
-    df.drop_duplicates(['stem'],inplace=True)
-    return list(df.sort_values('rank_sum')['index'].values[:n_outputs])
+    
+    rank_df = find_rank(filtered_candidates, list_popularity).reset_index()
+    rank_df.rename(columns={'index':'word'}, inplace=True)
+    rank_df['stem'] = rank_df['word'].apply(lambda x: stemmer.stem(x))
+    rank_df.drop_duplicates(['stem'],inplace=True)
+    
+    return list(rank_df.sort_values('rank')['word'].values[:n_outputs])
 
 
-@app.route('/')
+@app.before_first_request
+def load_data():
+    global listed_words
+    global list_popularity
+    global word_lists
+    global list_vecs
+    listed_words = get_clean_data(DATA_PATH/'valid_listed_words')
+    list_popularity = dict(listed_words.lcword.value_counts())
+    word_lists = get_clean_data(DATA_PATH'/valid_list_metadata')
+    list_vecs = get_pickle(DATA_PATH/'listvecs.pickle')
+
+
+    global model
+    model_path = DATA_PATH/'wiki.en.vec'
+    model = KeyedVectors.load_word2vec_format(model_path, binary=False)
+
+
+@app.route('/test_server')
 def hello_world():
-    import numpy as np
-    return 'Hello from Flask!'
+    return "Yep - the server's lighs are on and you know the address"
+
 
 @app.route('/word_pred/', methods=['POST'])
 def word_pred():
     data = request.get_json()
     input_words = data['input_words']
-    word_recommendations = recommend_words(input_words, n_outputs=10, multiple=5)
+    n_outputs = data.get('n_outputs') or 10
+    multiple = data.get('multiple') or 5
+    word_recommendations = recommend_words(input_words, n_outputs=n_outputs, multiple=multiple)
     
     return jsonify(status=200,
                    input_words=input_words,
-    #               word_recs=['this','was','a','test'])
                    word_recs=word_recommendations)
 
 
